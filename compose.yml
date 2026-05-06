@@ -1,0 +1,41 @@
+services:
+  ###################################################
+  # Service: backend (FastAPI)
+  ###################################################
+  backend:
+    container_name: wrench-log-api
+    image: wrench-log-api
+    build:
+      context: .
+      dockerfile: Dockerfile
+      target: backend-dev
+    volumes:
+      # Hot-reload: mount local code into container
+      - ./app:/app/backend/app
+    env_file:
+      - .env
+    environment:
+      # In Docker, mysql service is reached by container name
+      - DB_HOST=${DB_HOST:-mysql}
+      - DB_PORT=${DB_PORT:-3306}
+      - DB_NAME=${DB_NAME}
+      - DB_USER=${DB_USER}
+      - DB_PASSWORD=${DB_PASSWORD}
+      - CORS_ORIGINS=${CORS_ORIGINS:-["http://localhost"]}
+    labels:
+      - "traefik.enable=true"
+      - "traefik.http.routers.wrench-log-api.rule=Host(`wrench-log.local`) && PathPrefix(`/api`)"
+      - "traefik.http.services.wrench-log-api.loadbalancer.server.port=8000"
+      - "traefik.http.routers.wrench-log-api.entrypoints=web"
+    expose:
+      - 8000
+    networks:
+      - traefik-network
+    restart: unless-stopped
+
+###################################################
+# Networks
+###################################################
+networks:
+  traefik-network:
+    external: true
