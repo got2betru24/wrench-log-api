@@ -103,7 +103,9 @@ class ScheduleOut(OrmBase):
 # ─────────────────────────────────────────
 
 class EntryCreate(BaseModel):
-    schedule_id: Optional[int] = None
+    # schedule_ids replaces the old single schedule_id field.
+    # Pass an empty list for free-form entries.
+    schedule_ids: list[int] = []
     title: str
     notes: Optional[str] = None
     odometer: Optional[int] = None
@@ -113,7 +115,9 @@ class EntryCreate(BaseModel):
 
 
 class EntryUpdate(BaseModel):
-    schedule_id: Optional[int] = None
+    # When provided, replaces the full set of linked schedules.
+    # Omit the field entirely to leave existing links unchanged.
+    schedule_ids: Optional[list[int]] = None
     title: Optional[str] = None
     notes: Optional[str] = None
     odometer: Optional[int] = None
@@ -135,7 +139,8 @@ class AttachmentOut(OrmBase):
 class EntryOut(OrmBase):
     id: int
     vehicle_id: int
-    schedule_id: Optional[int]
+    # List of schedule IDs serviced by this entry (replaces single schedule_id)
+    schedule_ids: list[int] = []
     title: str
     notes: Optional[str]
     odometer: Optional[int]

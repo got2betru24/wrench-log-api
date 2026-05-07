@@ -19,7 +19,10 @@ class Settings(BaseSettings):
     max_upload_mb: int = 20
 
     # CORS
-    cors_origins: list[str] = ["http://localhost:5173", "http://localhost:3000","http://wrenchlog.local"],  # Production self-hosted]
+    cors_origins: list[str] = ["http://localhost:5173", 
+    "http://localhost:3000",
+    "http://wrenchlog.local", # Production self-hosted
+    ]  
 
     class Config:
         env_file = ".env"

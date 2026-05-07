@@ -3,18 +3,23 @@ from decimal import Decimal
 from typing import Optional
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select, func
-from app.models.models import Vehicle, MaintenanceSchedule, MaintenanceEntry
+from app.models.models import Vehicle, MaintenanceSchedule, MaintenanceEntry, entry_schedule_links
 from app.schemas.schemas import VehicleHealth, UpcomingItem, MileagePoint
 
 
 async def get_last_entry_for_schedule(
     db: AsyncSession, vehicle_id: int, schedule_id: int
 ) -> Optional[MaintenanceEntry]:
+    """Find the most recent entry for this vehicle linked to the given schedule."""
     result = await db.execute(
         select(MaintenanceEntry)
         .where(
             MaintenanceEntry.vehicle_id == vehicle_id,
-            MaintenanceEntry.schedule_id == schedule_id,
+            MaintenanceEntry.id.in_(
+                select(entry_schedule_links.c.entry_id).where(
+                    entry_schedule_links.c.schedule_id == schedule_id
+                )
+            ),
         )
         .order_by(MaintenanceEntry.performed_at.desc())
         .limit(1)
@@ -118,7 +123,6 @@ async def compute_vehicle_health(
             next_due_miles = current_odo + sched.interval_miles
 
         if sched.interval_months and last_date:
-            # months approximated as 30.44 days
             due = last_date + timedelta(days=int(sched.interval_months * 30.44))
             if next_due_date is None:
                 next_due_date = due

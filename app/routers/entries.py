@@ -7,7 +7,7 @@ from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
 from app.core.database import get_db
 from app.core.config import get_settings
-from app.models.models import Vehicle, MaintenanceEntry, EntryAttachment
+from app.models.models import Vehicle, MaintenanceSchedule, MaintenanceEntry, EntryAttachment
 from app.schemas.schemas import EntryCreate, EntryUpdate, EntryOut, AttachmentOut, MileagePoint
 
 router = APIRouter(tags=["Entries"])
@@ -24,6 +24,60 @@ async def _get_vehicle_or_404(vehicle_id: int, db: AsyncSession) -> Vehicle:
     if not v:
         raise HTTPException(status_code=404, detail="Vehicle not found")
     return v
+
+
+async def _resolve_schedules(
+    schedule_ids: list[int], vehicle_id: int, db: AsyncSession
+) -> list[MaintenanceSchedule]:
+    """Fetch and validate that all requested schedule IDs belong to this vehicle."""
+    if not schedule_ids:
+        return []
+    result = await db.execute(
+        select(MaintenanceSchedule).where(
+            MaintenanceSchedule.id.in_(schedule_ids),
+            MaintenanceSchedule.vehicle_id == vehicle_id,
+        )
+    )
+    found = result.scalars().all()
+    if len(found) != len(schedule_ids):
+        found_ids = {s.id for s in found}
+        missing = [sid for sid in schedule_ids if sid not in found_ids]
+        raise HTTPException(
+            status_code=404,
+            detail=f"Schedule IDs not found for this vehicle: {missing}",
+        )
+    return list(found)
+
+
+async def _entry_to_out(entry: MaintenanceEntry, db: AsyncSession) -> EntryOut:
+    """Eagerly load all relationships and refresh server-set columns while the session is live."""
+    await db.refresh(entry)  # reloads all columns (incl. server defaults like created_at)
+    await db.refresh(entry, ["attachments", "schedules"])  # load relationships
+    return EntryOut.model_validate({
+        "id": entry.id,
+        "vehicle_id": entry.vehicle_id,
+        "schedule_ids": [s.id for s in entry.schedules],
+        "title": entry.title,
+        "notes": entry.notes,
+        "odometer": entry.odometer,
+        "cost": entry.cost,
+        "shop_name": entry.shop_name,
+        "performed_at": entry.performed_at,
+        "created_at": entry.created_at,
+        "updated_at": entry.updated_at,
+        "attachments": [
+            {
+                "id": a.id,
+                "entry_id": a.entry_id,
+                "filename": a.filename,
+                "stored_name": a.stored_name,
+                "mime_type": a.mime_type,
+                "file_size": a.file_size,
+                "uploaded_at": a.uploaded_at,
+            }
+            for a in entry.attachments
+        ],
+    })
 
 
 # ─── Entries ───────────────────────────────────────────────────────────────────
@@ -44,10 +98,10 @@ async def list_entries(
         .offset(offset)
     )
     entries = result.scalars().all()
-    # Eagerly load attachments
+    out = []
     for entry in entries:
-        await db.refresh(entry, ["attachments"])
-    return entries
+        out.append(await _entry_to_out(entry, db))
+    return out
 
 
 @router.post(
@@ -59,11 +113,14 @@ async def create_entry(
     vehicle_id: int, payload: EntryCreate, db: AsyncSession = Depends(get_db)
 ):
     await _get_vehicle_or_404(vehicle_id, db)
-    entry = MaintenanceEntry(vehicle_id=vehicle_id, **payload.model_dump())
+    schedules = await _resolve_schedules(payload.schedule_ids, vehicle_id, db)
+
+    entry_data = payload.model_dump(exclude={"schedule_ids"})
+    entry = MaintenanceEntry(vehicle_id=vehicle_id, **entry_data)
+    entry.schedules = schedules
     db.add(entry)
     await db.flush()
-    await db.refresh(entry, ["attachments"])
-    return entry
+    return await _entry_to_out(entry, db)
 
 
 @router.get("/entries/{entry_id}", response_model=EntryOut)
@@ -71,8 +128,7 @@ async def get_entry(entry_id: int, db: AsyncSession = Depends(get_db)):
     entry = await db.get(MaintenanceEntry, entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
-    await db.refresh(entry, ["attachments"])
-    return entry
+    return await _entry_to_out(entry, db)
 
 
 @router.put("/entries/{entry_id}", response_model=EntryOut)
@@ -82,11 +138,19 @@ async def update_entry(
     entry = await db.get(MaintenanceEntry, entry_id)
     if not entry:
         raise HTTPException(status_code=404, detail="Entry not found")
-    for field, value in payload.model_dump(exclude_unset=True).items():
+
+    update_data = payload.model_dump(exclude_unset=True, exclude={"schedule_ids"})
+    for field, value in update_data.items():
         setattr(entry, field, value)
+
+    # Only replace schedule links if schedule_ids was explicitly provided
+    if payload.schedule_ids is not None:
+        await db.refresh(entry, ["schedules"])  # load current before replacing
+        schedules = await _resolve_schedules(payload.schedule_ids, entry.vehicle_id, db)
+        entry.schedules = schedules
+
     await db.flush()
-    await db.refresh(entry, ["attachments"])
-    return entry
+    return await _entry_to_out(entry, db)
 
 
 @router.delete("/entries/{entry_id}", status_code=status.HTTP_204_NO_CONTENT)

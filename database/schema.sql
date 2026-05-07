@@ -46,7 +46,6 @@ CREATE TABLE maintenance_schedules (
 CREATE TABLE maintenance_entries (
     id           INT UNSIGNED AUTO_INCREMENT PRIMARY KEY,
     vehicle_id   INT UNSIGNED  NOT NULL,
-    schedule_id  INT UNSIGNED  NULL COMMENT 'NULL = free-form entry',
     title        VARCHAR(150)  NOT NULL,
     notes        TEXT          NULL,
     odometer     INT UNSIGNED  NULL COMMENT 'Miles at time of service',
@@ -55,8 +54,19 @@ CREATE TABLE maintenance_entries (
     performed_at DATE          NOT NULL,
     created_at   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP,
     updated_at   DATETIME      NOT NULL DEFAULT CURRENT_TIMESTAMP ON UPDATE CURRENT_TIMESTAMP,
-    CONSTRAINT fk_entry_vehicle  FOREIGN KEY (vehicle_id)  REFERENCES vehicles(id)  ON DELETE CASCADE,
-    CONSTRAINT fk_entry_schedule FOREIGN KEY (schedule_id) REFERENCES maintenance_schedules(id) ON DELETE SET NULL
+    CONSTRAINT fk_entry_vehicle FOREIGN KEY (vehicle_id) REFERENCES vehicles(id) ON DELETE CASCADE
+);
+
+-- ─────────────────────────────────────────
+-- Entry ↔ Schedule links (many-to-many)
+-- One service visit can cover multiple schedule items
+-- ─────────────────────────────────────────
+CREATE TABLE entry_schedule_links (
+    entry_id    INT UNSIGNED NOT NULL,
+    schedule_id INT UNSIGNED NOT NULL,
+    PRIMARY KEY (entry_id, schedule_id),
+    CONSTRAINT fk_esl_entry    FOREIGN KEY (entry_id)    REFERENCES maintenance_entries(id)    ON DELETE CASCADE,
+    CONSTRAINT fk_esl_schedule FOREIGN KEY (schedule_id) REFERENCES maintenance_schedules(id)  ON DELETE CASCADE
 );
 
 -- ─────────────────────────────────────────
@@ -78,10 +88,5 @@ CREATE TABLE entry_attachments (
 -- Indexes
 -- ─────────────────────────────────────────
 CREATE INDEX idx_entries_vehicle_date ON maintenance_entries (vehicle_id, performed_at DESC);
-CREATE INDEX idx_entries_schedule     ON maintenance_entries (schedule_id);
 CREATE INDEX idx_schedules_vehicle    ON maintenance_schedules (vehicle_id);
-
--- ─────────────────────────────────────────
--- Seed: common schedule templates
--- (These are inserted at app level per vehicle, this is just reference)
--- ─────────────────────────────────────────
+CREATE INDEX idx_esl_schedule         ON entry_schedule_links (schedule_id);
