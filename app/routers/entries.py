@@ -1,23 +1,39 @@
+import csv
+import io
+import logging
 import uuid
 import aiofiles
+from datetime import datetime
+from decimal import Decimal, InvalidOperation
 from pathlib import Path
+
 from fastapi import APIRouter, Depends, HTTPException, UploadFile, File, status
 from fastapi.responses import FileResponse
 from sqlalchemy.ext.asyncio import AsyncSession
 from sqlalchemy import select
+
 from app.core.database import get_db
 from app.core.config import get_settings
 from app.models.models import Vehicle, MaintenanceSchedule, MaintenanceEntry, EntryAttachment
-from app.schemas.schemas import EntryCreate, EntryUpdate, EntryOut, AttachmentOut, MileagePoint
+from app.schemas.schemas import (
+    EntryCreate, EntryUpdate, EntryOut, AttachmentOut, MileagePoint,
+    ImportResult, ImportRowError,
+)
 
 router = APIRouter(tags=["Entries"])
 settings = get_settings()
+logger = logging.getLogger(__name__)
 
 ALLOWED_MIME = {
     "image/jpeg", "image/png", "image/webp", "image/gif",
     "application/pdf",
 }
 
+CSV_REQUIRED_COLS = {"Date", "Odometer", "Title"}
+CSV_DATE_FORMATS = ["%m/%d/%Y", "%Y-%m-%d", "%m-%d-%Y"]
+
+
+# ─── Helpers ──────────────────────────────────────────────────────────────────
 
 async def _get_vehicle_or_404(vehicle_id: int, db: AsyncSession) -> Vehicle:
     v = await db.get(Vehicle, vehicle_id)
@@ -51,8 +67,8 @@ async def _resolve_schedules(
 
 async def _entry_to_out(entry: MaintenanceEntry, db: AsyncSession) -> EntryOut:
     """Eagerly load all relationships and refresh server-set columns while the session is live."""
-    await db.refresh(entry)  # reloads all columns (incl. server defaults like created_at)
-    await db.refresh(entry, ["attachments", "schedules"])  # load relationships
+    await db.refresh(entry)
+    await db.refresh(entry, ["attachments", "schedules"])
     return EntryOut.model_validate({
         "id": entry.id,
         "vehicle_id": entry.vehicle_id,
@@ -80,7 +96,23 @@ async def _entry_to_out(entry: MaintenanceEntry, db: AsyncSession) -> EntryOut:
     })
 
 
-# ─── Entries ───────────────────────────────────────────────────────────────────
+def _parse_date(raw: str):
+    for fmt in CSV_DATE_FORMATS:
+        try:
+            return datetime.strptime(raw.strip(), fmt).date()
+        except ValueError:
+            continue
+    return None
+
+
+def _parse_odometer(raw: str):
+    try:
+        return int(raw.strip().replace(",", ""))
+    except ValueError:
+        return None
+
+
+# ─── Entries ──────────────────────────────────────────────────────────────────
 
 @router.get("/vehicles/{vehicle_id}/entries", response_model=list[EntryOut])
 async def list_entries(
@@ -98,10 +130,7 @@ async def list_entries(
         .offset(offset)
     )
     entries = result.scalars().all()
-    out = []
-    for entry in entries:
-        out.append(await _entry_to_out(entry, db))
-    return out
+    return [await _entry_to_out(e, db) for e in entries]
 
 
 @router.post(
@@ -114,13 +143,126 @@ async def create_entry(
 ):
     await _get_vehicle_or_404(vehicle_id, db)
     schedules = await _resolve_schedules(payload.schedule_ids, vehicle_id, db)
-
     entry_data = payload.model_dump(exclude={"schedule_ids"})
     entry = MaintenanceEntry(vehicle_id=vehicle_id, **entry_data)
     entry.schedules = schedules
     db.add(entry)
     await db.flush()
     return await _entry_to_out(entry, db)
+
+
+@router.post(
+    "/vehicles/{vehicle_id}/entries/import",
+    response_model=ImportResult,
+    status_code=status.HTTP_201_CREATED,
+)
+async def import_entries_csv(
+    vehicle_id: int,
+    file: UploadFile = File(...),
+    skip_errors: bool = False,
+    db: AsyncSession = Depends(get_db),
+):
+    await _get_vehicle_or_404(vehicle_id, db)
+    logger.info(
+        "CSV import started: vehicle_id=%s filename=%r content_type=%r",
+        vehicle_id, file.filename, file.content_type,
+    )
+
+    raw_bytes = await file.read()
+    logger.debug("CSV import: read %d bytes", len(raw_bytes))
+
+    try:
+        content = raw_bytes.decode("utf-8-sig")  # strip BOM if present
+    except UnicodeDecodeError:
+        logger.warning("CSV import failed: not UTF-8 (vehicle_id=%s)", vehicle_id)
+        raise HTTPException(status_code=400, detail="File must be UTF-8 encoded.")
+
+    reader = csv.DictReader(io.StringIO(content))
+
+    if not reader.fieldnames:
+        logger.warning("CSV import failed: empty file (vehicle_id=%s)", vehicle_id)
+        raise HTTPException(status_code=400, detail="CSV file is empty.")
+
+    logger.debug("CSV import: detected columns %s", list(reader.fieldnames))
+
+    missing_cols = CSV_REQUIRED_COLS - set(reader.fieldnames)
+    if missing_cols:
+        logger.warning(
+            "CSV import failed: missing columns %s (vehicle_id=%s)",
+            sorted(missing_cols), vehicle_id,
+        )
+        raise HTTPException(
+            status_code=400,
+            detail=f"Missing required columns: {', '.join(sorted(missing_cols))}",
+        )
+
+    entries_to_add = []
+    row_errors: list[ImportRowError] = []
+
+    for i, row in enumerate(reader, start=2):  # row 1 = header
+        errors = []
+
+        raw_date = row.get("Date", "").strip()
+        performed_at = _parse_date(raw_date)
+        if performed_at is None:
+            errors.append(
+                f"Invalid date {raw_date!r} (expected MM/DD/YYYY or YYYY-MM-DD)"
+            )
+
+        raw_odometer = row.get("Odometer", "").strip()
+        odometer = _parse_odometer(raw_odometer)
+        if odometer is None:
+            errors.append(
+                f"Invalid odometer {raw_odometer!r} (must be a number)"
+            )
+
+        title = row.get("Title", "").strip()
+        if not title:
+            errors.append("Title is required")
+
+        if errors:
+            logger.debug("CSV import: row %d failed validation: %s", i, errors)
+            row_errors.append(ImportRowError(row=i, errors=errors))
+            continue
+
+        entries_to_add.append(
+            MaintenanceEntry(
+                vehicle_id=vehicle_id,
+                title=title,
+                performed_at=performed_at,
+                odometer=odometer,
+                shop_name=row.get("Shop", "").strip() or None,
+                notes=row.get("Notes", "").strip() or None,
+                cost=None,
+            )
+        )
+
+    if row_errors:
+        if not skip_errors:
+            logger.warning(
+                "CSV import aborted: %d row error(s) out of %d data row(s) (vehicle_id=%s)",
+                len(row_errors), len(entries_to_add) + len(row_errors), vehicle_id,
+            )
+            raise HTTPException(
+                status_code=422,
+                detail={
+                    "message": f"{len(row_errors)} row(s) failed validation.",
+                    "row_errors": [e.model_dump() for e in row_errors],
+                },
+            )
+        logger.info(
+            "CSV import: skipping %d invalid row(s), importing %d valid (vehicle_id=%s)",
+            len(row_errors), len(entries_to_add), vehicle_id,
+        )
+
+    db.add_all(entries_to_add)
+    await db.flush()
+    logger.info(
+        "CSV import complete: imported %d entries (vehicle_id=%s)",
+        len(entries_to_add), vehicle_id,
+    )
+
+    return ImportResult(imported=len(entries_to_add), skipped=0)
 
 
 @router.get("/entries/{entry_id}", response_model=EntryOut)
@@ -143,9 +285,8 @@ async def update_entry(
     for field, value in update_data.items():
         setattr(entry, field, value)
 
-    # Only replace schedule links if schedule_ids was explicitly provided
     if payload.schedule_ids is not None:
-        await db.refresh(entry, ["schedules"])  # load current before replacing
+        await db.refresh(entry, ["schedules"])
         schedules = await _resolve_schedules(payload.schedule_ids, entry.vehicle_id, db)
         entry.schedules = schedules
 

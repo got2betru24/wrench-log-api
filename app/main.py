@@ -4,6 +4,12 @@ from fastapi.middleware.cors import CORSMiddleware
 from app.core.config import get_settings
 from app.core.database import engine, Base
 from app.routers import vehicles, schedules, entries, dashboard
+import logging
+
+logging.basicConfig(
+    level=logging.DEBUG,  # swap to INFO in production
+    format="%(asctime)s %(levelname)s %(name)s — %(message)s",
+)
 
 settings = get_settings()
 
